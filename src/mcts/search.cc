@@ -1716,6 +1716,9 @@ void SearchWorker::PickNodesToExtendTask(
   const float odd_draw_score = search_->GetDrawScore(true);
   const auto& root_move_filter = search_->root_move_filter_;
   auto m_evaluator = moves_left_support_ ? MEvaluator(params_) : MEvaluator();
+  bool pol_boost = params_.GetPol_boost();
+  float idx_q = 0.0f;
+
 
   int max_limit = std::numeric_limits<int>::max();
 
@@ -1855,6 +1858,7 @@ void SearchWorker::PickNodesToExtendTask(
         // Perform UCT for current node.
         float best = std::numeric_limits<float>::lowest();
         int best_idx = -1;
+        float pol_q = 0.0f;
         float best_without_u = std::numeric_limits<float>::lowest();
         float second_best = std::numeric_limits<float>::lowest();
         bool can_exit = false;
@@ -1871,9 +1875,9 @@ void SearchWorker::PickNodesToExtendTask(
           }
           int nstarted = current_nstarted[idx];
           const float util = current_util[idx];
+          idx_q = cur_iters[idx].GetQ(0.0f, 0.0f);
           if (idx > cache_filled_idx) {
             float p = cur_iters[idx].GetP();
-            counter = sizeof(current_pol);
             if (pol_boost == true) {
                if (visited[idx] == true) {
                    if (top_utils[idx] > util) {
@@ -2362,13 +2366,6 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process,
     bool root_stm = (search_->contempt_mode_ == ContemptMode::BLACK) ==
                     search_->played_history_.Last().IsBlackToMove();
     auto sign = (root_stm ^ (node_to_process->depth & 1)) ? 1.0f : -1.0f;
-    bool mustwin = false;
-    if (params_.GetMustWin()) {
-    mustwin = search_->played_history_.Last().IsBlackToMove();
-    }
-    float max_s = mustwin ? 0.0f :
-                          (params_.GetWDLRescaleDiff()) + w;
-    
     float ratio = params_.GetWDLRescaleRatio();
     WDLRescale(v, d, ratio,
                search_->contempt_mode_ == ContemptMode::NONE

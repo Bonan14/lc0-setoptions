@@ -162,6 +162,7 @@ class SearchParams {
     return kMaxCollisionVisitsScalingPower;
   }
   bool GetSearchSpinBackoff() const { return kSearchSpinBackoff; }
+  bool GetPol_boost() const { return kPol_boost; }
 
   // Search parameter IDs.
   static const OptionId kMiniBatchSizeId;
@@ -235,6 +236,7 @@ class SearchParams {
   static const OptionId kUCIOpponentId;
   static const OptionId kUCIRatingAdvId;
   static const OptionId kSearchSpinBackoffId;
+  static const OptionId kPol_boostId;
 
  private:
   const OptionsDict& options_;
@@ -293,6 +295,7 @@ class SearchParams {
   const int kMaxCollisionVisitsScalingEnd;
   const float kMaxCollisionVisitsScalingPower;
   const bool kSearchSpinBackoff;
+  const bool kPol_boost;
 };
 
 }  // namespace lczero
