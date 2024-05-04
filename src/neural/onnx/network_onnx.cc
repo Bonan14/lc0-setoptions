@@ -53,7 +53,7 @@
 namespace lczero {
 namespace {
 
-enum class OnnxProvider { CPU, CUDA, DML, ROCM };
+enum class OnnxProvider { CPU, CUDA, DML, ROCM, OPENVINO };
 
 class OnnxNetwork;
 
@@ -291,7 +291,7 @@ Ort::SessionOptions GetOptions(OnnxProvider provider, int gpu, int threads,
                                int batch_size) {
   Ort::SessionOptions options;
   options.SetIntraOpNumThreads(threads);
-  options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+  options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
 
   if (batch_size > 0) {
     // Override the default (variable) batch size.
@@ -318,6 +318,30 @@ Ort::SessionOptions GetOptions(OnnxProvider provider, int gpu, int threads,
       options.AppendExecutionProvider_ROCM(rocm_options);
       break;
     }
+   case OnnxProvider::OPENVINO: {
+      std::unordered_map<std::string, std::string> openvino_options;
+      openvino_options["device_type"] = "GPU_FP32";
+      openvino_options["device_id"] = "GPU";
+      openvino_options["num_of_threads"] = "threads";
+      openvino_options["num_streams"] = "8";
+      openvino_options["cache_dir"] = "Blob_dumps";
+      //options["context"] = "0x123456ff";
+      openvino_options["enable_opencl_throttling"] = "false";
+      options.AppendExecutionProvider_OpenVINO_V2(openvino_options);
+      break;
+    }
+      /*case OnnxProvider::OPENVINO: {
+      OrtOpenVINOProviderOptions openvino_options;
+	  openvino_options.device_type = "GPU_FP32";
+      openvino_options.device_id = "GPU";
+	  openvino_options.cache_dir = "Blob_dumps";
+	  //openvino_options.context = (void *) ocl_instance->_context.get();
+	  openvino_options.enable_opencl_throttling = false;
+	  openvino_options.enable_dynamic_shapes = false;
+	  openvino_options.num_of_threads = size_t(threads);
+	  options.AppendExecutionProvider_OpenVINO(openvino_options);
+      break;
+    }*/
     case OnnxProvider::CUDA: {
       OrtCUDAProviderOptions cuda_options;
       cuda_options.device_id = gpu;
@@ -400,15 +424,15 @@ std::unique_ptr<Network> MakeOnnxNetwork(const std::optional<WeightsFile>& w,
   int gpu = opts.GetOrDefault<int>("gpu", 0);
 
   int batch_size =
-      opts.GetOrDefault<int>("batch", kProvider == OnnxProvider::DML ? 16 : -1);
+      opts.GetOrDefault<int>("batch", kProvider == OnnxProvider::OPENVINO ? 7 : -1);
 
   int steps =
-      opts.GetOrDefault<int>("steps", kProvider == OnnxProvider::DML ? 4 : 1);
+      opts.GetOrDefault<int>("steps", kProvider == OnnxProvider::OPENVINO ? 4 : 1);
 
   int threads =
       opts.GetOrDefault<int>("threads", kProvider == OnnxProvider::CPU ? 1 : 0);
 
-  if (batch_size <= 0) batch_size = -1;  // Variable batch size.
+  //if (batch_size <= 0) batch_size = -1;  // Variable batch size.
 
   if (w->has_onnx_model()) {
     return std::make_unique<OnnxNetwork>(*w, opts, kProvider, gpu, threads,
@@ -444,8 +468,10 @@ std::unique_ptr<Network> MakeOnnxNetwork(const std::optional<WeightsFile>& w,
   }
 }
 
+//REGISTER_NETWORK("onnx-openvino", MakeOnnxNetwork<OnnxProvider::OPENVINO>, 64)
+REGISTER_NETWORK("onnx-openvino", MakeOnnxNetwork<OnnxProvider::OPENVINO>, 65)
 #ifdef USE_ROCM
-REGISTER_NETWORK("onnx-rocm", MakeOnnxNetwork<OnnxProvider::ROCM>, 64)
+REGISTER_NETWORK("onnx-rocm", MakeOnnxNetwork<OnnxProvider::ROCM>, 69)
 #endif
 #ifdef USE_DML
 REGISTER_NETWORK("onnx-dml", MakeOnnxNetwork<OnnxProvider::DML>, 63)

@@ -111,7 +111,7 @@ class MEvaluator {
   float GetMUtility(Node* child, float q) const {
     if (!enabled_ || !parent_within_threshold_) return 0.0f;
     const float child_m = child->GetM();
-    float m = std::clamp(m_slope_ * (child_m - parent_m_), -m_cap_, m_cap_);
+    float m = std::clamp(m_slope_ * (child_m - parent_m_), -m_cap_ - 1, m_cap_ + 1);
     m *= FastSign(-q);
     if (q_threshold_ > 0.0f && q_threshold_ < 1.0f) {
       // This allows a smooth M effect with higher q thresholds, which is
@@ -124,12 +124,14 @@ class MEvaluator {
 
   float GetMUtility(const EdgeAndNode& child, float q) const {
     if (!enabled_ || !parent_within_threshold_) return 0.0f;
-    if (child.GetN() == 0) return GetDefaultMUtility();
+    if (child.GetN() == 0) return 0.0f;
     return GetMUtility(child.node(), q);
   }
 
   // The M utility to use for unvisited nodes.
-  float GetDefaultMUtility() const { return 0.0f; }
+  float GetDefaultMUtility() const { 
+  return 0.0f; 
+  }
 
  private:
   static bool WithinThreshold(const Node* parent, float q_threshold) {
@@ -220,6 +222,88 @@ void ApplyDirichletNoise(Node* node, float eps, double alpha) {
 }  // namespace
 
 namespace {
+// We use this custom sigmoid function to map the num_edges
+// to a range between 0.3 and 2.5. 
+// We’ll shift the sigmoid function to have a midpoint 
+// at 25.5 (midway between 1 and 50).    
+inline float custom_sigmoid(float x) {
+            float shifted_x = x - 0.5f;
+            return 0.9f + 1.5f * (1.0f / (1.0f + std::exp(-shifted_x)));
+      }
+// We use the sigmoid function incase 
+// sharpness is below 0.2 and num_edges is not 1.
+inline float c_sigmoid(float x) {
+    float shifted_x = x - 0.5f;
+     return 0.2 + 1.0f * (1.0f / (1.0f + std::exp(-shifted_x)));
+    }
+    
+inline double ShortMates(NodeTree* tree, Network* network, const OptionsDict& options,
+                 std::unique_ptr<UciResponder> responder) {
+  auto input_format = network->GetCapabilities().input_format;
+
+  const auto& board = tree->GetPositionHistory().Last().GetBoard();
+  auto legal_moves = board.GenerateLegalMoves();
+  tree->GetCurrentHead()->CreateEdges(legal_moves);
+  PositionHistory history = tree->GetPositionHistory();
+  std::vector<InputPlanes> planes;
+  for (auto edge : tree->GetCurrentHead()->Edges()) {
+    history.Append(edge.GetMove());
+    if (history.ComputeGameResult() == GameResult::UNDECIDED) {
+      planes.emplace_back(EncodePositionForNN(
+          input_format, history, 8, FillEmptyHistory::FEN_ONLY, nullptr));
+    }
+    history.Pop();
+  }
+
+  std::vector<float> comp_q;
+  int batch_size = options.Get<int>(SearchParams::kMiniBatchSizeId);
+  if (batch_size == 0) batch_size = network->GetMiniBatchSize();
+
+  for (size_t i = 0; i < planes.size(); i += batch_size) {
+    auto comp = network->NewComputation();
+    for (int j = 0; j < batch_size; j++) {
+      comp->AddInput(std::move(planes[i + j]));
+      if (i + j + 1 == planes.size()) break;
+    }
+    comp->ComputeBlocking();
+
+    for (int j = 0; j < batch_size; j++) comp_q.push_back(comp->GetQVal(j));
+  }
+
+  Move best;
+  int comp_idx = 0;
+  float max_q = std::numeric_limits<float>::lowest();
+  for (auto edge : tree->GetCurrentHead()->Edges()) {
+    history.Append(edge.GetMove());
+    auto result = history.ComputeGameResult();
+    float q = -1;
+    if (result == GameResult::UNDECIDED) {
+      // NN eval is for side to move perspective - so if its good, its bad for
+      // us.
+      q = -comp_q[comp_idx];
+      comp_idx++;
+    } else if (result == GameResult::DRAW) {
+      q = 0;
+    } else {
+      // A legal move to a non-drawn terminal without tablebases must be a
+      // win.
+      q = 1;
+    }
+    if (q >= max_q) {
+      max_q = q;
+      best = edge.GetMove(tree->GetPositionHistory().IsBlackToMove());
+    }
+    history.Pop();
+  }
+  std::vector<ThinkingInfo> infos;
+  ThinkingInfo thinking;
+  thinking.depth = 1;
+  infos.push_back(thinking);
+  responder->OutputThinkingInfo(&infos);
+  BestMoveInfo info(best);
+  responder->OutputBestMove(&info);
+}
+
 // WDL conversion formula based on random walk model.
 inline double WDLRescale(float& v, float& d, float wdl_rescale_ratio,
                          float wdl_rescale_diff, float sign, bool invert,
@@ -232,17 +316,19 @@ inline double WDLRescale(float& v, float& d, float wdl_rescale_ratio,
   auto l = (1 - v - d) / 2;
   // Safeguard against numerical issues; skip WDL transformation if WDL is too
   // extreme.
-  const float eps = 0.0001f;
+  const float eps = 0.000009f;
   if (w > eps && d > eps && l > eps && w < (1.0f - eps) && d < (1.0f - eps) &&
       l < (1.0f - eps)) {
     auto a = FastLog(1 / l - 1);
     auto b = FastLog(1 / w - 1);
-    auto s = 2 / (a + b);
+    auto s_old = 2 / (a + b);
+    auto s = (invert || max_s == 0.0f) ? s_old : max_s;
     // Safeguard against unrealistically broad WDL distributions coming from
-    // the NN. Originally hardcoded, made into a parameter for piece odds.
-    if (!invert) s = std::min(max_reasonable_s, s);
+    // the NN. Could be made into a parameter, but probably unnecessary.
+    const float max_reasonable_s = 1.4f;
     auto mu = (a - b) / (a + b);
-    auto s_new = s * wdl_rescale_ratio;
+    auto s_new = (invert) ? s * wdl_rescale_ratio : s;
+    //auto s_new =  s * wdl_rescale_ratio;
     if (invert) {
       std::swap(s, s_new);
       s = std::min(max_reasonable_s, s);
@@ -1582,6 +1668,7 @@ void SearchWorker::PickNodesToExtendTask(
     const std::vector<Move>& moves_to_base,
     std::vector<NodeToProcess>* receiver,
     TaskWorkspace* workspace) NO_THREAD_SAFETY_ANALYSIS {
+  // Bonan....
   // TODO: Bring back pre-cached nodes created outside locks in a way that works
   // with tasks.
   // TODO: pre-reserve visits_to_perform for expected depth and likely maximum
@@ -1603,11 +1690,18 @@ void SearchWorker::PickNodesToExtendTask(
   // These 2 are 'filled pre-emptively'.
   std::array<float, 256> current_pol;
   std::array<float, 256> current_util;
+  std::array<bool, 256> visited;
+
 
   // These 3 are 'filled on demand'.
   std::array<float, 256> current_score;
   std::array<int, 256> current_nstarted;
   auto& cur_iters = workspace->cur_iters;
+
+  constexpr int num_top = 51;
+  constexpr float num_last = 0.0f;
+  float num_boost = 0.0f;
+  std::array<float, num_top> top_utils;
 
   Node::Iterator best_edge;
   Node::Iterator second_best_edge;
@@ -1696,10 +1790,20 @@ void SearchWorker::PickNodesToExtendTask(
       if (!is_root_node || root_move_filter.empty()) {
         max_needed = std::min(max_needed, node->GetNStarted() + cur_limit + 2);
       }
+     
       node->CopyPolicy(max_needed, current_pol.data());
       for (int i = 0; i < max_needed; i++) {
-        current_util[i] = std::numeric_limits<float>::lowest();
+          current_util[i] = -10000.0f;
+          visited[i] = false;
+          
       }
+       for (int i = 0; i < num_top; i++) {
+        top_utils[i] = -10000.0f;
+       }
+      // the root eval from my perspective
+      const float root_eval =
+          search_->root_node_->GetWL();
+          
       // Root depth is 1 here, while for GetDrawScore() it's 0-based, that's why
       // the weirdness.
       const float draw_score = ((current_path.size() + base_depth) % 2 == 0)
@@ -1711,14 +1815,36 @@ void SearchWorker::PickNodesToExtendTask(
         int index = child->Index();
         visited_pol += current_pol[index];
         float q = child->GetQ(draw_score);
-        current_util[index] = q + m_evaluator.GetMUtility(child, q);
+        auto util = q + m_evaluator.GetMUtility(child, q);
+        current_util[index] = util;
+        visited[index] = true;
+        for (int i = num_top; i > 0; i--) {
+            if (q > top_utils[i]) {
+              for (int j = 0; j < i; j++) {
+                top_utils[j] = top_utils[j + 1];
+              }
+              top_utils[i] = q;
+              top_utils[50] = -10000.0f;
+            }
+         }
       }
       const float fpu =
-          GetFpu(params_, node, is_root_node, draw_score, visited_pol);
-      for (int i = 0; i < max_needed; i++) {
-        if (current_util[i] == std::numeric_limits<float>::lowest()) {
-          current_util[i] = fpu + m_evaluator.GetDefaultMUtility();
-        }
+          GetFpu(params_, node, is_root_node, draw_score, visited_pol); 
+        for (int i = 0; i < max_needed; i++) {          
+         //float q = node->GetQ(draw_score);
+         auto util_ = fpu + (m_evaluator.GetDefaultMUtility() - (i / 100.0f));         
+              if (current_util[i] == -10000.0f) {
+              current_util[i] = util_;
+              visited[i] = false;
+              }
+          }
+      // If the eval at root is positive but at the current node is negative,
+      // greatly increase first play urgency
+	  float fpu_boost = 1.0f;
+      if (root_eval > 0 && -node->GetWL() < 0 ||
+          root_eval > 0 &&
+         (node->GetM() / 2.0f) < 2.0f) {
+        fpu_boost = 2.5f;
       }
 
       const float cpuct = ComputeCpuct(params_, node->GetN(), is_root_node);
@@ -1746,6 +1872,20 @@ void SearchWorker::PickNodesToExtendTask(
           int nstarted = current_nstarted[idx];
           const float util = current_util[idx];
           if (idx > cache_filled_idx) {
+            float p = cur_iters[idx].GetP();
+            counter = sizeof(current_pol);
+            if (pol_boost == true) {
+               if (visited[idx] == true) {
+                   if (top_utils[idx] > util) {
+                      pol_q = (idx_q > 0.85f) ? 
+                              0.05f : 0.0f;
+                      p += pol_q;
+                     }
+                   if (idx_q < -0.95f) { p -= 0.08f; }
+                 } else {
+              p = p * fpu_boost;                                 
+              }
+            }
             current_score[idx] =
                 current_pol[idx] * puct_mult / (1 + nstarted) + util;
             cache_filled_idx++;
@@ -1794,9 +1934,15 @@ void SearchWorker::PickNodesToExtendTask(
           int estimated_visits_to_change_best = std::numeric_limits<int>::max();
           if (best_without_u < second_best) {
             const auto n1 = current_nstarted[best_idx] + 1;
+            float pol_Q =  cur_iters[best_idx].GetQ(0.0f, 0.0f);
+            float p_best = current_util[best_idx];
+            float p = current_pol[best_idx];
+            if (pol_boost == true) {
+            if (top_utils[best_idx] > p_best && visited[best_idx] &&
+                pol_Q > 0.85f) { p += 0.05f; }
+            }
             estimated_visits_to_change_best = static_cast<int>(
-                std::max(1.0f, std::min(current_pol[best_idx] * puct_mult /
-                                                (second_best - best_without_u) -
+                std::max(1.0f, std::min(p * puct_mult / (second_best - best_without_u) -
                                             n1 + 1,
                                         1e9f)));
           }
@@ -2206,6 +2352,9 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process,
   // First the value...
   auto v = -computation.GetQVal(idx_in_computation);
   auto d = computation.GetDVal(idx_in_computation);
+  auto w = (1 + v - d) / 2;
+  auto l = (1 - v - d) / 2;
+  //float wl = w - l;
   if (params_.GetWDLRescaleRatio() != 1.0f ||
       (params_.GetWDLRescaleDiff() != 0.0f &&
        search_->contempt_mode_ != ContemptMode::NONE)) {
@@ -2213,7 +2362,15 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process,
     bool root_stm = (search_->contempt_mode_ == ContemptMode::BLACK) ==
                     search_->played_history_.Last().IsBlackToMove();
     auto sign = (root_stm ^ (node_to_process->depth & 1)) ? 1.0f : -1.0f;
-    WDLRescale(v, d, params_.GetWDLRescaleRatio(),
+    bool mustwin = false;
+    if (params_.GetMustWin()) {
+    mustwin = search_->played_history_.Last().IsBlackToMove();
+    }
+    float max_s = mustwin ? 0.0f :
+                          (params_.GetWDLRescaleDiff()) + w;
+    
+    float ratio = params_.GetWDLRescaleRatio();
+    WDLRescale(v, d, ratio,
                search_->contempt_mode_ == ContemptMode::NONE
                    ? 0
                    : params_.GetWDLRescaleDiff(),
