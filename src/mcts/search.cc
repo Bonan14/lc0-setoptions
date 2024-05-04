@@ -321,14 +321,14 @@ inline double WDLRescale(float& v, float& d, float wdl_rescale_ratio,
       l < (1.0f - eps)) {
     auto a = FastLog(1 / l - 1);
     auto b = FastLog(1 / w - 1);
-    auto s_old = 2 / (a + b);
-    auto s = (invert || max_s == 0.0f) ? s_old : max_s;
+    auto s = 2 / (a + b);
+    //auto s = (invert || max_s == 0.0f) ? s_old : max_s;
     // Safeguard against unrealistically broad WDL distributions coming from
     // the NN. Could be made into a parameter, but probably unnecessary.
     const float max_reasonable_s = 1.4f;
     auto mu = (a - b) / (a + b);
-    auto s_new = (invert) ? s * wdl_rescale_ratio : s;
-    //auto s_new =  s * wdl_rescale_ratio;
+    //auto s_new = (invert) ? s * wdl_rescale_ratio : s;
+    auto s_new =  s * wdl_rescale_ratio;
     if (invert) {
       std::swap(s, s_new);
       s = std::min(max_reasonable_s, s);
